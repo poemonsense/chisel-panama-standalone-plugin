@@ -9,3 +9,7 @@ add_public_tablegen_target(CIRCTStandalonePassesIncGen)
 set(LLVM_TARGET_DEFINITIONS PrintFirrtlOpsPass.td)
 mlir_tablegen(PrintFirrtlOpsPass.h.inc --gen-pass-decls)
 add_public_tablegen_target(StandalonePrintFirrtlOpsPassIncGen)
+
+set(LLVM_TARGET_DEFINITIONS CoverPointPass.td)
+mlir_tablegen(CoverPointPass.h.inc --gen-pass-decls)
+add_public_tablegen_target(CoverPointPassIncGen)
