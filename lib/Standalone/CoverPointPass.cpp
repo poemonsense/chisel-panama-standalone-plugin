@@ -136,7 +136,15 @@ std::optional<CoverPointInfo> CoverPointPass::getCoverPointInfo(Operation *op) {
 
         CoverPointInfo info;
         info.op = op;
+
         info.name = nameAttr.getValue().str();
+        // the name may also be implicitly extracted from the operation
+        if (info.name == "unknown") {
+          if (auto nameAttr = op->getAttrOfType<StringAttr>("name")) {
+            info.name = nameAttr.getValue().str();
+          }
+        }
+
         info.group = groupAttr.getValue().str();
         info.modName = op->getParentOfType<FModuleOp>().getName().str();
         return info;
