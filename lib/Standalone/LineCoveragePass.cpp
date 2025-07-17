@@ -24,12 +24,19 @@ void registerLineCoveragePass() {
 void LineCoveragePass::runOnOperation() {
   auto circuit = getOperation();
 
-  circuit.walk([&](WhenOp when) {
-    auto condVal = when.getCondition();
+  circuit.walk([&](WhenOp whenOp) {
+    auto condVal = whenOp.getCondition();
     if (!condVal || condVal.getType().isConst())
       return;
 
     auto condDefOp = condVal.getDefiningOp();
+    if (!condDefOp) {
+      OpBuilder builder(whenOp);
+      builder.setInsertionPoint(whenOp);
+      auto defName = builder.getStringAttr("cover_dummy_node");
+      condDefOp = builder.create<WireOp>(whenOp.getLoc(), condVal.getType(), defName);
+      builder.create<ConnectOp>(condDefOp->getLoc(), condDefOp->getResult(0), condVal);
+    }
 
     annotateCoverPoint(condDefOp, "line", circuit);
   });
