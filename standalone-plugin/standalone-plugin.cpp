@@ -19,6 +19,7 @@
 #include "Standalone/StandalonePasses.h"
 #include "Standalone/PrintFirrtlOpsPass.h"
 #include "Standalone/CoverPointPass.h"
+#include "Standalone/LineCoveragePass.h"
 
 using namespace mlir;
 
@@ -43,5 +44,6 @@ extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo mlirGetPassPluginInfo() {
             mlir::standalone::registerPasses();
             mlir::standalone::registerPrintFirrtlOpsPass();
             mlir::standalone::registerCoverPointPass();
+            mlir::standalone::registerLineCoveragePass();
           }};
 }

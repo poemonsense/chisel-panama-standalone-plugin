@@ -13,3 +13,7 @@ add_public_tablegen_target(StandalonePrintFirrtlOpsPassIncGen)
 set(LLVM_TARGET_DEFINITIONS CoverPointPass.td)
 mlir_tablegen(CoverPointPass.h.inc --gen-pass-decls)
 add_public_tablegen_target(CoverPointPassIncGen)
+
+set(LLVM_TARGET_DEFINITIONS LineCoveragePass.td)
+mlir_tablegen(LineCoveragePass.h.inc --gen-pass-decls)
+add_public_tablegen_target(LineCoveragePassIncGen)

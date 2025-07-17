@@ -2,11 +2,6 @@
 #include <filesystem>
 #include <fstream>
 
-#include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
-#include "circt/Dialect/FIRRTL/FIRRTLDialect.h"
-#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
-#include "mlir/Pass/Pass.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "llvm/Support/FormatVariadic.h"
 
 #include "Standalone/CoverPointPass.h"
@@ -16,6 +11,37 @@ using namespace circt::firrtl;
 
 #define GEN_PASS_DEF_COVERPOINTPASS
 #include "Standalone/CoverPointPass.h.inc"
+
+void annotateCoverPoint(
+  Operation *op,
+  const std::string &name,
+  const std::string &groupName,
+  CircuitOp &circuit
+) {
+  MLIRContext *context = circuit.getContext();
+  OpBuilder builder(circuit);
+
+  auto coverAnno = mlir::DictionaryAttr::get(context, {
+    builder.getNamedAttr("class", builder.getStringAttr("xfuzz.CoverPointAnnotation")),
+    builder.getNamedAttr("name", builder.getStringAttr(name)),
+    builder.getNamedAttr("group", builder.getStringAttr(groupName)),
+  });
+  op->setAttr("annotations", builder.getArrayAttr({coverAnno}));
+}
+
+void annotateCoverPoint(
+  Operation *op,
+  const std::string &groupName,
+  CircuitOp &circuit
+) {
+  std::string name;
+  if (auto nameAttr = op->getAttrOfType<StringAttr>("name"))
+    name = nameAttr.str();
+  else
+    name = op->getName().getStringRef().str();
+
+  annotateCoverPoint(op, name, groupName, circuit);
+}
 
 class CoverPointInfo {
 public:
