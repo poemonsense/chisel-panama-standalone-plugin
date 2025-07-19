@@ -5,7 +5,7 @@ add_mlir_dialect_library(CIRCTStandalone
         StandalonePasses.cpp
         PrintFirrtlOpsPass.cpp
         CoverPointPass.cpp
-        LineCoveragePass.cpp
+        BranchCoveragePass.cpp
 
         ADDITIONAL_HEADER_DIRS
         ${PROJECT_SOURCE_DIR}/include/Standalone
@@ -15,7 +15,7 @@ add_mlir_dialect_library(CIRCTStandalone
         CIRCTStandalonePassesIncGen
         StandalonePrintFirrtlOpsPassIncGen
         CoverPointPassIncGen
-        LineCoveragePassIncGen
+        BranchCoveragePassIncGen
 
         LINK_LIBS PUBLIC
         MLIRIR

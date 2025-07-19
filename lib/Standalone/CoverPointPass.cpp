@@ -17,7 +17,7 @@ Operation *findDefOp(Value v, Operation *consumerOp) {
   if (!defOp || defOp->getNumResults() > 1) {
     OpBuilder builder(consumerOp);
     builder.setInsertionPoint(consumerOp);
-    auto defName = builder.getStringAttr("line_cover_dummy");
+    auto defName = builder.getStringAttr("cover_dummy");
     defOp = builder.create<WireOp>(consumerOp->getLoc(), v.getType(), defName);
     builder.create<ConnectOp>(defOp->getLoc(), defOp->getResult(0), v);
   }

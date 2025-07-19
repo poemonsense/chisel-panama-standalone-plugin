@@ -1,14 +1,14 @@
-#include "Standalone/LineCoveragePass.h"
+#include "Standalone/BranchCoveragePass.h"
 #include "Standalone/CoverPointPass.h"
 
 namespace mlir::standalone {
 using namespace circt::firrtl;
 
-#define GEN_PASS_DEF_LINECOVERAGEPASS
-#include "Standalone/LineCoveragePass.h.inc"
+#define GEN_PASS_DEF_BRANCHCOVERAGEPASS
+#include "Standalone/BranchCoveragePass.h.inc"
 
-class LineCoveragePass
-  : public impl::LineCoveragePassBase<LineCoveragePass> {
+class BranchCoveragePass
+  : public impl::BranchCoveragePassBase<BranchCoveragePass> {
 public:
   void runOnOperation() final;
 
@@ -16,26 +16,26 @@ private:
   Value getNonConstBranchCondition(Operation *op);
 };
 
-std::unique_ptr<mlir::Pass> createLineCoveragePass() {
-  return std::make_unique<LineCoveragePass>();
+std::unique_ptr<mlir::Pass> createBranchCoveragePass() {
+  return std::make_unique<BranchCoveragePass>();
 }
 
-void registerLineCoveragePass() {
-  PassRegistration<LineCoveragePass>();
+void registerBranchCoveragePass() {
+  PassRegistration<BranchCoveragePass>();
 }
 
-void LineCoveragePass::runOnOperation() {
+void BranchCoveragePass::runOnOperation() {
   auto circuit = getOperation();
 
   circuit.walk([&](Operation *op) {
     auto condVal = getNonConstBranchCondition(op);
     if (!condVal)
       return;
-    annotateCoverPoint(findDefOp(condVal, op), "line", circuit);
+    annotateCoverPoint(findDefOp(condVal, op), "branch", circuit);
   });
 }
 
-Value LineCoveragePass::getNonConstBranchCondition(Operation *op) {
+Value BranchCoveragePass::getNonConstBranchCondition(Operation *op) {
   // when (cond) { ... }
   if (auto whenOp = dyn_cast<WhenOp>(op)) {
     auto cond = whenOp.getCondition();
