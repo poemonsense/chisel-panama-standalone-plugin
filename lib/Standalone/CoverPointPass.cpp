@@ -88,6 +88,7 @@ private:
 
   Value getClock(FModuleOp moduleOp, OpBuilder &builder);
   Value getReset(FModuleOp moduleOp, OpBuilder &builder);
+  std::tuple<bool, Value, Value> getClockAndReset(FModuleOp moduleOp, OpBuilder &builder);
 
   InstanceOp createExtModule(const CoverPointInfo &c, Location loc, CircuitOp circuitOp, OpBuilder &builder);
 
@@ -138,12 +139,13 @@ void CoverPointPass::runOnOperation() {
       c->modName = moduleOp.getName().str();
 
       // clock, reset
-      auto clock = getClock(moduleOp, builder);
-      auto reset = getReset(moduleOp, builder);
+      auto [cached, clock, reset] = getClockAndReset(moduleOp, builder);
       if (!clock || !reset) {
-        mlir::emitWarning(moduleOp.getLoc()) << "[" << moduleOp.getName()
-            << "] clock/reset port not found. Skip cover point: " << c->name;
         c = points.erase(c);
+        if (!cached) {
+          mlir::emitWarning(moduleOp.getLoc()) << "[" << moduleOp.getName()
+              << "] clock/reset port not found. Skip all cover points.";
+        }
         continue;
       }
 
@@ -319,12 +321,6 @@ void CoverPointPass::findFieldInPorts(
 }
 
 Value CoverPointPass::getClock(FModuleOp moduleOp, OpBuilder &builder) {
-  static std::unordered_map<std::string, Value> clockCache;
-  auto cacheKey = moduleOp.getName().str();
-  if (auto it = clockCache.find(cacheKey); it != clockCache.end()) {
-    return it->second;
-  }
-
   auto ports = moduleOp.getPorts();
 
   SmallVector<Value> clockPorts;
@@ -338,17 +334,10 @@ Value CoverPointPass::getClock(FModuleOp moduleOp, OpBuilder &builder) {
     // TODO: raise warning here
   }
 
-  clockCache[cacheKey] = clockPorts.front();
-  return clockCache[cacheKey];
+  return clockPorts.front();
 }
 
 Value CoverPointPass::getReset(FModuleOp moduleOp, OpBuilder &builder) {
-  static std::unordered_map<std::string, Value> resetCache;
-  auto cacheKey = moduleOp.getName().str();
-  if (auto it = resetCache.find(cacheKey); it != resetCache.end()) {
-    return it->second;
-  }
-
   auto ports = moduleOp.getPorts();
 
   SmallVector<Value> resetPorts;
@@ -368,8 +357,21 @@ Value CoverPointPass::getReset(FModuleOp moduleOp, OpBuilder &builder) {
     // TODO: raise warning here
   }
 
-  resetCache[cacheKey] = resetPorts.front();
-  return resetCache[cacheKey];
+  return resetPorts.front();
+}
+
+std::tuple<bool, Value, Value> CoverPointPass::getClockAndReset(FModuleOp moduleOp, OpBuilder &builder) {
+  static std::unordered_map<std::string, std::pair<Value, Value>> cache;
+  auto cacheKey = moduleOp.getName().str();
+  if (auto it = cache.find(cacheKey); it != cache.end()) {
+    auto [clock, reset] = it->second;
+    return {true, clock, reset};
+  }
+
+  auto clock = getClock(moduleOp, builder);
+  auto reset = getReset(moduleOp, builder);
+  cache[cacheKey] = {clock, reset};
+  return {false, clock, reset};
 }
 
 InstanceOp CoverPointPass::createExtModule(const CoverPointInfo &c, Location loc, CircuitOp circuitOp, OpBuilder &builder) {
