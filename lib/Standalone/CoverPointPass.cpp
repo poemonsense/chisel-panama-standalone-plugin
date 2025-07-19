@@ -64,7 +64,15 @@ public:
   std::string modName;
 
   int width = -1;
-  int index = -1;
+
+  Operation *cover;
+};
+
+class ModuleCoverPointInfo {
+public:
+  std::vector<int> indices;
+  Value clock;
+  Value reset;
 };
 
 class CoverPointPass
@@ -102,12 +110,9 @@ private:
   Value getReset(FModuleOp moduleOp, OpBuilder &builder);
   std::tuple<bool, Value, Value> getClockAndReset(FModuleOp moduleOp, OpBuilder &builder);
 
-  InstanceOp createExtModule(const CoverPointInfo &c, Location loc, CircuitOp circuitOp, OpBuilder &builder);
+  InstanceOp createExtModule(std::string group, int index, int width, Location loc, CircuitOp circuitOp, OpBuilder &builder);
 
   // C++/Verilog gen
-  inline std::string getExtModuleName(const CoverPointInfo &c) {
-    return getExtModuleName(c.group, c.width);
-  }
   inline std::string getExtModuleName(const std::string &groupName, int w) {
     return "CoverPointDPI_w" + std::to_string(w) + "_" + groupName;
   }
@@ -141,14 +146,13 @@ void CoverPointPass::runOnOperation() {
 
   // iterate over each group of cover points
   for (auto &[groupName, points]: coverPoints) {
+    std::unordered_map<std::string, ModuleCoverPointInfo> modCoverPoints;
+
     auto index = 0;
     for (auto c = points.begin(); c != points.end(); ) {
       auto moduleOp = c->op->getParentOfType<FModuleOp>();
       auto builder = OpBuilder::atBlockBegin(moduleOp.getBodyBlock());
       auto isTopLevel = isa<FModuleOp>(c->op->getParentOp());
-
-      c->index = index++;
-      c->modName = moduleOp.getName().str();
 
       // clock, reset
       auto [cached, clock, reset] = getClockAndReset(moduleOp, builder);
@@ -160,6 +164,14 @@ void CoverPointPass::runOnOperation() {
         }
         continue;
       }
+
+      c->modName = moduleOp.getName().str();
+      if (modCoverPoints.find(c->modName) == modCoverPoints.end()) {
+        modCoverPoints[c->modName] = ModuleCoverPointInfo();
+        modCoverPoints[c->modName].clock = clock;
+        modCoverPoints[c->modName].reset = reset;
+      }
+      modCoverPoints[c->modName].indices.push_back(index++);
 
       Value curValue = c->op->getResult(0);
       auto t = dyn_cast<IntType>(curValue.getType().cast<FIRRTLType>());
@@ -204,6 +216,7 @@ void CoverPointPass::runOnOperation() {
 
       // val xorVal = cover_reg ^ curValue
       auto xorVal = builder.create<XorPrimOp>(loc, c->op->getResult(0), reg.getResult());
+      c->cover = xorVal;
 
       if (!isTopLevel) {
         // xor_reg := xorVal
@@ -211,29 +224,51 @@ void CoverPointPass::runOnOperation() {
         if (reset.getType().isa<AsyncResetType>()) {
           auto zero = builder.create<ConstantOp>(loc, t, APInt(c->width, 0));
           auto mux = builder.create<MuxPrimOp>(loc, reset, zero, xorVal.getResult());
-          builder.create<ConnectOp>(loc, xorReg.getResult(), mux.getResult());
+          builder.create<ConnectOp>(loc, xorAsyncReg.getResult(), mux.getResult());
         } else {
           builder.create<ConnectOp>(loc, xorReg.getResult(), xorVal.getResult());
         }
-      }
-
-      // create tail expressions: DPI-C BlackBox and IO connections
-      builder = OpBuilder::atBlockEnd(moduleOp.getBodyBlock());
-
-      // connect xorVal (or xor_reg) to the cover point BlackBox
-      auto inst = this->createExtModule(*c, loc, circuitOp, builder);
-      builder.create<ConnectOp>(loc, inst.getResult(0), clock);
-      // reset (Reset/AsyncReset) should be converted to UInt
-      auto resetUInt = builder.create<AsUIntPrimOp>(loc, reset);
-      builder.create<ConnectOp>(loc, inst.getResult(1), resetUInt.getResult());
-      if (isTopLevel) {
-        builder.create<ConnectOp>(loc, inst.getResult(2), xorVal.getResult());
-      } else {
-        builder.create<ConnectOp>(loc, inst.getResult(2), xorReg.getResult());
+        c->cover = xorReg;
       }
 
       c++;
     }
+
+    // one DPI-C BlackBox and IO connections for each module
+    index = 0;
+    for (auto &[modName, modCover] : modCoverPoints) {
+      auto moduleOp = circuitOp.lookupSymbol<FModuleOp>(modName);
+      auto builder = OpBuilder::atBlockEnd(moduleOp.getBodyBlock());
+
+      // cover values are concatenated
+      Value concatVal = nullptr;
+      auto totalWidth = 0;
+      for (auto idx : modCover.indices) {
+        totalWidth += points[idx].width;
+        auto cover = points[idx].cover->getResult(0);
+        if (!concatVal) {
+          concatVal = cover;
+        } else {
+          concatVal = builder.create<CatPrimOp>(moduleOp.getLoc(), cover, concatVal);
+        }
+      }
+
+      // connect xorVal (or xor_reg) to the cover point BlackBox
+      auto loc = builder.getUnknownLoc();
+      auto inst = this->createExtModule(groupName, index, totalWidth, loc, circuitOp, builder);
+      builder.create<ConnectOp>(loc, inst.getResult(0), modCover.clock);
+      // reset (Reset/AsyncReset) should be converted to UInt
+      auto resetUInt = builder.create<AsUIntPrimOp>(loc, modCover.reset);
+      builder.create<ConnectOp>(loc, inst.getResult(1), resetUInt.getResult());
+      builder.create<ConnectOp>(loc, inst.getResult(2), concatVal);
+
+      index += totalWidth;
+
+      llvm::outs() << "[INFO] Created " << inst.getName() << " in module " << modName
+        << " for group: " << groupName << " (" << totalWidth << " bits)\n";
+    }
+
+    llvm::outs() << "[INFO] Created " << index << " cover points for group: " << groupName << "\n";
   }
 
   std::string outputDir = getenv("NOOP_HOME") + std::string("/build/generated-src");
@@ -386,23 +421,23 @@ std::tuple<bool, Value, Value> CoverPointPass::getClockAndReset(FModuleOp module
   return {false, clock, reset};
 }
 
-InstanceOp CoverPointPass::createExtModule(const CoverPointInfo &c, Location loc, CircuitOp circuitOp, OpBuilder &builder) {
+InstanceOp CoverPointPass::createExtModule(std::string group, int index, int width, Location loc, CircuitOp circuitOp, OpBuilder &builder) {
   Block *circuitBlock = &circuitOp.getBody().front();
   OpBuilder::InsertPoint saveIP = builder.saveInsertionPoint();
   builder.setInsertionPointToStart(circuitBlock);
 
   auto *context = builder.getContext();
 
-  auto extModName = getExtModuleName(c);
+  auto extModName = getExtModuleName(group, width);
 
   auto clock = PortInfo(builder.getStringAttr("clock"), ClockType::get(context), Direction::In);;
   auto reset = PortInfo(builder.getStringAttr("reset"), UIntType::get(context, 1), Direction::In);
-  auto valid = PortInfo(builder.getStringAttr("valid"), UIntType::get(context, c.width), Direction::In);
+  auto valid = PortInfo(builder.getStringAttr("valid"), UIntType::get(context, width), Direction::In);
   SmallVector<circt::firrtl::PortInfo> ports = {clock, reset, valid};
 
   auto convention = ConventionAttr::get(context, Convention::Internal);
 
-  std::string verilogBody = getExtModuleBody(c.group, c.width);
+  std::string verilogBody = getExtModuleBody(group, width);
   auto blackboxInlineAnno = mlir::DictionaryAttr::get(
     context,
     {
@@ -413,14 +448,14 @@ InstanceOp CoverPointPass::createExtModule(const CoverPointInfo &c, Location loc
   auto annotations = builder.getArrayAttr({blackboxInlineAnno});
 
   auto nameAttr = builder.getStringAttr("COVER_INDEX");
-  auto intValue = builder.getI32IntegerAttr(c.index);
+  auto intValue = builder.getI32IntegerAttr(index);
   auto intType = intValue.getType();
   auto paramAttr = ParamDeclAttr::get(context, nameAttr, intType, intValue);
   auto parameters = builder.getArrayAttr({paramAttr});
 
   auto extModule = builder.create<FExtModuleOp>(
     loc,
-    builder.getStringAttr(extModName + "_" + std::to_string(c.index)),
+    builder.getStringAttr(extModName + "_" + std::to_string(index)),
     convention,
     ports,
     extModName,
