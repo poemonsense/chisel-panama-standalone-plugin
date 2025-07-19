@@ -31,17 +31,7 @@ void LineCoveragePass::runOnOperation() {
     auto condVal = getNonConstBranchCondition(op);
     if (!condVal)
       return;
-
-    auto condDefOp = condVal.getDefiningOp();
-    if (!condDefOp) {
-      OpBuilder builder(op);
-      builder.setInsertionPoint(op);
-      auto defName = builder.getStringAttr("line_cover_dummy");
-      condDefOp = builder.create<WireOp>(op->getLoc(), condVal.getType(), defName);
-      builder.create<ConnectOp>(condDefOp->getLoc(), condDefOp->getResult(0), condVal);
-    }
-
-    annotateCoverPoint(condDefOp, "line", circuit);
+    annotateCoverPoint(findDefOp(condVal, op), "line", circuit);
   });
 }
 

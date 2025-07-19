@@ -12,6 +12,18 @@ using namespace circt::firrtl;
 #define GEN_PASS_DEF_COVERPOINTPASS
 #include "Standalone/CoverPointPass.h.inc"
 
+Operation *findDefOp(Value v, Operation *consumerOp) {
+  auto defOp = v.getDefiningOp();
+  if (!defOp || defOp->getNumResults() > 1) {
+    OpBuilder builder(consumerOp);
+    builder.setInsertionPoint(consumerOp);
+    auto defName = builder.getStringAttr("line_cover_dummy");
+    defOp = builder.create<WireOp>(consumerOp->getLoc(), v.getType(), defName);
+    builder.create<ConnectOp>(defOp->getLoc(), defOp->getResult(0), v);
+  }
+  return defOp;
+};
+
 void annotateCoverPoint(
   Operation *op,
   const std::string &name,

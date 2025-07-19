@@ -11,6 +11,8 @@ std::unique_ptr<mlir::Pass> createCoverPointPass();
 
 void registerCoverPointPass();
 
+Operation *findDefOp(Value v, Operation *consumerOp);
+
 void annotateCoverPoint(
   Operation *op,
   const std::string &name,
