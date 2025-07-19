@@ -65,7 +65,30 @@ private:
   std::unordered_map<std::string, std::vector<CoverPointInfo>> coverPoints;
 
   std::optional<CoverPointInfo> getCoverPointInfo(Operation *op);
-  std::pair<Value, Value> getClockAndReset(Operation *op);
+
+  void findFieldInPort(
+    std::function<Value(void)> lazyValue,
+    StringRef name,
+    Type type,
+    std::function<bool(Type, StringRef)> fieldCond,
+    bool dirCond,
+    SmallVectorImpl<Value> &results,
+    FModuleOp moduleOp,
+    OpBuilder &builder
+  );
+
+  void findFieldInPorts(
+    SmallVector<PortInfo> &ports,
+    std::function<bool(Type, StringRef)> fieldCond,
+    Direction direction,
+    SmallVectorImpl<Value> &results,
+    FModuleOp moduleOp,
+    OpBuilder &builder
+  );
+
+  Value getClock(FModuleOp moduleOp, OpBuilder &builder);
+  Value getReset(FModuleOp moduleOp, OpBuilder &builder);
+
   InstanceOp createExtModule(const CoverPointInfo &c, Location loc, CircuitOp circuitOp, OpBuilder &builder);
 
   // C++/Verilog gen
@@ -95,43 +118,107 @@ void registerCoverPointPass() {
 
 void CoverPointPass::runOnOperation() {
   CircuitOp circuitOp = getOperation();
-  OpBuilder builder(&getContext());
 
   // get all cover points
   circuitOp->walk([&](Operation *op) mutable {
     if (auto cOpt = getCoverPointInfo(op)) {
-      cOpt->index = coverPoints[cOpt->group].size();
       coverPoints[cOpt->group].push_back(*cOpt);
     }
   });
 
   // iterate over each group of cover points
   for (auto &[groupName, points]: coverPoints) {
-    for (auto &c : points) {
-      Value curValue = c.op->getResult(0);
+    auto index = 0;
+    for (auto c = points.begin(); c != points.end(); ) {
+      auto moduleOp = c->op->getParentOfType<FModuleOp>();
+      auto builder = OpBuilder::atBlockBegin(moduleOp.getBodyBlock());
+      auto isTopLevel = isa<FModuleOp>(c->op->getParentOp());
+
+      c->index = index++;
+      c->modName = moduleOp.getName().str();
+
+      // clock, reset
+      auto clock = getClock(moduleOp, builder);
+      auto reset = getReset(moduleOp, builder);
+      if (!clock || !reset) {
+        mlir::emitWarning(moduleOp.getLoc()) << "[" << moduleOp.getName()
+            << "] clock/reset port not found. Skip cover point: " << c->name;
+        c = points.erase(c);
+        continue;
+      }
+
+      Value curValue = c->op->getResult(0);
       auto t = dyn_cast<IntType>(curValue.getType().cast<FIRRTLType>());
-      c.width = t.getWidthOrSentinel();
+      c->width = t.getWidthOrSentinel();
+      Location loc = c->op->getLoc();
 
-      builder.setInsertionPointAfter(c.op);
-      Location loc = c.op->getLoc();
+      // builder must be moved after clock and reset
+      auto clockOp = clock.getDefiningOp();
+      if (clockOp && builder.getInsertionPoint()->isBeforeInBlock(clockOp)) {
+        builder.setInsertionPointAfter(clockOp);
+      }
+      auto resetOp = reset.getDefiningOp();
+      if (resetOp && builder.getInsertionPoint()->isBeforeInBlock(resetOp)) {
+        builder.setInsertionPointAfter(resetOp);
+      }
 
-      // val cover_reg = RegNext(curValue, 0)
-      auto zeroValue = APInt(c.width, 0);
-      auto zero = builder.create<ConstantOp>(loc, t, zeroValue);
+      // Create the `x_reg` for cover point `x`
+      // val x_reg = RegNext(x)
       auto regName = builder.getStringAttr("cover_reg");
-      auto [clock, reset] = getClockAndReset(c.op);
-      auto reg = builder.create<RegResetOp>(
-          loc, t, clock, reset, zero, regName);
-      builder.create<ConnectOp>(loc, reg.getResult(), curValue);
+      auto reg = builder.create<RegOp>(loc, t, clock, regName);
+
+      // If the cover point `x` is under some When context,
+      // we need to add another xor_reg to capture `x` ^ `x_reg`.
+      // val xor_reg = RegNext(x ^ x_reg, 0.U)
+      RegResetOp xorReg;
+      RegOp xorAsyncReg;
+      if (!isTopLevel) {
+        auto xorRegName = builder.getStringAttr("xor_reg");
+        if (reset.getType().isa<AsyncResetType>()) {
+          xorAsyncReg = builder.create<RegOp>(loc, t, clock, xorRegName);
+        } else {
+          auto zero = builder.create<ConstantOp>(loc, t, APInt(c->width, 0));
+          xorReg = builder.create<RegResetOp>(loc, t, clock, reset, zero, xorRegName);
+        }
+      }
+
+      // create in-place expressions: update x_reg (and xor_reg if necessary)
+      builder = OpBuilder::atBlockEnd(c->op->getBlock());
+
+      // x_reg := x
+      builder.create<ConnectOp>(loc, reg.getResult(), c->op->getResult(0));
 
       // val xorVal = cover_reg ^ curValue
-      auto xorVal = builder.create<XorPrimOp>(loc, curValue, reg.getResult());
+      auto xorVal = builder.create<XorPrimOp>(loc, c->op->getResult(0), reg.getResult());
 
-      // connect xorVal to the cover point BlackBox
-      auto inst = this->createExtModule(c, loc, circuitOp, builder);
+      if (!isTopLevel) {
+        // xor_reg := xorVal
+        // Chisel feature? For async reset behavior, insert mux: reset ? 0.U : xorVal
+        if (reset.getType().isa<AsyncResetType>()) {
+          auto zero = builder.create<ConstantOp>(loc, t, APInt(c->width, 0));
+          auto mux = builder.create<MuxPrimOp>(loc, reset, zero, xorVal.getResult());
+          builder.create<ConnectOp>(loc, xorReg.getResult(), mux.getResult());
+        } else {
+          builder.create<ConnectOp>(loc, xorReg.getResult(), xorVal.getResult());
+        }
+      }
+
+      // create tail expressions: DPI-C BlackBox and IO connections
+      builder = OpBuilder::atBlockEnd(moduleOp.getBodyBlock());
+
+      // connect xorVal (or xor_reg) to the cover point BlackBox
+      auto inst = this->createExtModule(*c, loc, circuitOp, builder);
       builder.create<ConnectOp>(loc, inst.getResult(0), clock);
-      builder.create<ConnectOp>(loc, inst.getResult(1), reset);
-      builder.create<ConnectOp>(loc, inst.getResult(2), xorVal.getResult());
+      // reset (Reset/AsyncReset) should be converted to UInt
+      auto resetUInt = builder.create<AsUIntPrimOp>(loc, reset);
+      builder.create<ConnectOp>(loc, inst.getResult(1), resetUInt.getResult());
+      if (isTopLevel) {
+        builder.create<ConnectOp>(loc, inst.getResult(2), xorVal.getResult());
+      } else {
+        builder.create<ConnectOp>(loc, inst.getResult(2), xorReg.getResult());
+      }
+
+      c++;
     }
   }
 
@@ -143,61 +230,146 @@ void CoverPointPass::runOnOperation() {
 
 std::optional<CoverPointInfo> CoverPointPass::getCoverPointInfo(Operation *op) {
   auto attr = op->getAttr("annotations");
-  if (auto arrayAttr = attr.dyn_cast_or_null<mlir::ArrayAttr>()) {
-    for (auto elem : arrayAttr) {
-      if (auto dict = elem.dyn_cast<mlir::DictionaryAttr>()) {
-        auto classAttr = dict.getAs<mlir::StringAttr>("class");
-        if (!classAttr || !classAttr.getValue().endswith(".CoverPointAnnotation"))
-          continue;
+  auto arrayAttr = attr.dyn_cast_or_null<mlir::ArrayAttr>();
 
-        auto nameAttr = dict.getAs<mlir::StringAttr>("name");
-        auto groupAttr = dict.getAs<mlir::StringAttr>("group");
+  if (!arrayAttr)
+    return std::nullopt;
 
-        if (!nameAttr || !groupAttr) {
-          llvm::errs() << "[ERROR] Annotation found with class = " << classAttr.getValue()
-                       << ", but missing 'name' or 'group'\n";
-          llvm::errs() << "[ERROR] Full annotation dict: " << dict << "\n";
-          llvm::report_fatal_error("getCoverPointInfo: missing 'name' or 'group' field");
-        }
+  for (auto elem : arrayAttr) {
+    auto dict = elem.dyn_cast<mlir::DictionaryAttr>();
 
-        CoverPointInfo info;
-        info.op = op;
+    if (!dict)
+      continue;
 
+    auto classAttr = dict.getAs<mlir::StringAttr>("class");
+    if (!classAttr || !classAttr.getValue().endswith(".CoverPointAnnotation"))
+      continue;
+
+    auto nameAttr = dict.getAs<mlir::StringAttr>("name");
+    auto groupAttr = dict.getAs<mlir::StringAttr>("group");
+
+    if (!nameAttr || !groupAttr) {
+      llvm::errs() << "[ERROR] Annotation found with class = " << classAttr.getValue()
+                    << ", but missing 'name' or 'group'\n";
+      llvm::errs() << "[ERROR] Full annotation dict: " << dict << "\n";
+      llvm::report_fatal_error("getCoverPointInfo: missing 'name' or 'group' field");
+    }
+
+    CoverPointInfo info;
+    info.op = op;
+    info.name = nameAttr.getValue().str();
+    // the name may also be implicitly extracted from the operation
+    if (info.name == "unknown") {
+      if (auto nameAttr = op->getAttrOfType<StringAttr>("name")) {
         info.name = nameAttr.getValue().str();
-        // the name may also be implicitly extracted from the operation
-        if (info.name == "unknown") {
-          if (auto nameAttr = op->getAttrOfType<StringAttr>("name")) {
-            info.name = nameAttr.getValue().str();
-          }
-        }
-
-        info.group = groupAttr.getValue().str();
-        info.modName = op->getParentOfType<FModuleOp>().getName().str();
-        return info;
       }
     }
+    info.group = groupAttr.getValue().str();
+
+    return info;
   }
 
   return std::nullopt;
 }
 
+void CoverPointPass::findFieldInPort(
+  std::function<Value(void)> lazyValue,
+  StringRef name,
+  Type type,
+  std::function<bool(Type, StringRef)> fieldCond,
+  bool dirCond,
+  SmallVectorImpl<Value> &results,
+  FModuleOp moduleOp,
+  OpBuilder &builder
+) {
+  if (fieldCond(type, name)) {
+    if (dirCond) {
+      results.push_back(lazyValue());
+    }
+  }
+  else if (auto bundle = type.dyn_cast<BundleType>()) {
+    for (auto it : llvm::enumerate(bundle.getElements())) {
+      size_t index = it.index();
+      const auto &elem = it.value();
+      bool fieldIsTargetDirection = dirCond ^ elem.isFlip;
+      auto subfield = [&]() {
+        return builder.create<SubfieldOp>(moduleOp.getLoc(), elem.type, lazyValue(), index);
+      };
+      findFieldInPort(subfield, elem.name, elem.type, fieldCond, fieldIsTargetDirection, results, moduleOp, builder);
+    }
+  }
+}
 
-std::pair<Value, Value> CoverPointPass::getClockAndReset(Operation *op) {
-  auto parentMod = op->getParentOfType<FModuleOp>();
-  auto *body = parentMod.getBodyBlock();
-  Value clock, reset;
+void CoverPointPass::findFieldInPorts(
+  SmallVector<PortInfo> &ports,
+  std::function<bool(Type, StringRef)> fieldCond,
+  Direction direction,
+  SmallVectorImpl<Value> &results,
+  FModuleOp moduleOp,
+  OpBuilder &builder
+) {
+  auto *body = moduleOp.getBodyBlock();
+  for (auto it : llvm::enumerate(moduleOp.getPorts())) {
+    auto index = it.index();
+    auto &port = it.value();
+    bool isTargetDir = port.direction == direction;
+    auto portVal = [&]() { return body->getArgument(index); };
+    findFieldInPort(portVal, port.name, port.type, fieldCond, isTargetDir, results, moduleOp, builder);
+  }
+}
 
-  for (auto [idx, port] : llvm::enumerate(parentMod.getPorts())) {
-    if (port.name == "clock")
-      clock = body->getArgument(idx);
-    else if (port.name == "reset")
-      reset = body->getArgument(idx);
+Value CoverPointPass::getClock(FModuleOp moduleOp, OpBuilder &builder) {
+  static std::unordered_map<std::string, Value> clockCache;
+  auto cacheKey = moduleOp.getName().str();
+  if (auto it = clockCache.find(cacheKey); it != clockCache.end()) {
+    return it->second;
   }
 
-  if (!clock || !reset)
-    llvm::report_fatal_error("getClockAndReset: clock/reset port not found");
+  auto ports = moduleOp.getPorts();
 
-  return {clock, reset};
+  SmallVector<Value> clockPorts;
+  auto clockCond = [](Type t, StringRef name) { return t.isa<ClockType>(); };
+  findFieldInPorts(ports, clockCond, Direction::In, clockPorts, moduleOp, builder);
+
+  if (clockPorts.empty())
+    return nullptr;
+
+  if (clockPorts.size() > 1) {
+    // TODO: raise warning here
+  }
+
+  clockCache[cacheKey] = clockPorts.front();
+  return clockCache[cacheKey];
+}
+
+Value CoverPointPass::getReset(FModuleOp moduleOp, OpBuilder &builder) {
+  static std::unordered_map<std::string, Value> resetCache;
+  auto cacheKey = moduleOp.getName().str();
+  if (auto it = resetCache.find(cacheKey); it != resetCache.end()) {
+    return it->second;
+  }
+
+  auto ports = moduleOp.getPorts();
+
+  SmallVector<Value> resetPorts;
+  auto resetCond = [](Type t, StringRef name) {
+    if (t.isa<ResetType>() || t.isa<AsyncResetType>())
+      return true;
+    if (auto uintType = t.dyn_cast<UIntType>())
+      return uintType.getWidthOrSentinel() == 1 && name.endswith("reset");
+    return false;
+  };
+  findFieldInPorts(ports, resetCond, Direction::In, resetPorts, moduleOp, builder);
+
+  if (resetPorts.empty())
+    return nullptr;
+
+  if (resetPorts.size() > 1) {
+    // TODO: raise warning here
+  }
+
+  resetCache[cacheKey] = resetPorts.front();
+  return resetCache[cacheKey];
 }
 
 InstanceOp CoverPointPass::createExtModule(const CoverPointInfo &c, Location loc, CircuitOp circuitOp, OpBuilder &builder) {
