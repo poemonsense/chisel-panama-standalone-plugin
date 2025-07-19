@@ -116,7 +116,12 @@ private:
   inline std::string getExtModuleName(const std::string &groupName, int w) {
     return "CoverPointDPI_w" + std::to_string(w) + "_" + groupName;
   }
-  std::string getExtModuleBody(const std::string &groupName, int w);
+  std::string getExtModuleBody(
+    const std::string &groupName,
+    int w,
+    bool isRaw,
+    bool isMultibit
+  );
 
   inline std::string getDpicFuncName(const std::string &groupName) {
     return "cover_dpi_" + groupName;
@@ -421,7 +426,14 @@ std::tuple<bool, Value, Value> CoverPointPass::getClockAndReset(FModuleOp module
   return {false, clock, reset};
 }
 
-InstanceOp CoverPointPass::createExtModule(std::string group, int index, int width, Location loc, CircuitOp circuitOp, OpBuilder &builder) {
+InstanceOp CoverPointPass::createExtModule(
+  std::string group,
+  int index,
+  int width,
+  Location loc,
+  CircuitOp circuitOp,
+  OpBuilder &builder
+) {
   Block *circuitBlock = &circuitOp.getBody().front();
   OpBuilder::InsertPoint saveIP = builder.saveInsertionPoint();
   builder.setInsertionPointToStart(circuitBlock);
@@ -437,7 +449,7 @@ InstanceOp CoverPointPass::createExtModule(std::string group, int index, int wid
 
   auto convention = ConventionAttr::get(context, Convention::Internal);
 
-  std::string verilogBody = getExtModuleBody(group, width);
+  std::string verilogBody = getExtModuleBody(group, width, false, true);
   auto blackboxInlineAnno = mlir::DictionaryAttr::get(
     context,
     {
@@ -478,7 +490,12 @@ InstanceOp CoverPointPass::createExtModule(std::string group, int index, int wid
   return inst;
 }
 
-std::string CoverPointPass::getExtModuleBody(const std::string &groupName, int w) {
+std::string CoverPointPass::getExtModuleBody(
+  const std::string &groupName,
+  int w,
+  bool isRaw,
+  bool isMultibit
+) {
   auto extModName = getExtModuleName(groupName, w);
   auto dpiFuncName = getDpicFuncName(groupName);
 
@@ -486,11 +503,8 @@ std::string CoverPointPass::getExtModuleBody(const std::string &groupName, int w
     return _w > 1 ? "[" + std::to_string(_w - 1) + " : 0] " : "";
   };
   std::string io = llvm::formatv("input clock,\n  input reset,\n  input {0}valid", w_s(w));
-
-  auto isRaw = false;
   std::string extraCond = (w > 1 || isRaw) ? "" : " && valid";
 
-  auto isMultibit = false;
   std::string funcCall;
   if (isMultibit && w > 1) {
     std::stringstream ss;
@@ -510,7 +524,7 @@ std::string CoverPointPass::getExtModuleBody(const std::string &groupName, int w
   verilog << "module " << extModName << "(\n  " << io << "\n);\n";
   verilog << "  parameter COVER_INDEX;\n";
   verilog << "`ifndef SYNTHESIS\n";
-  verilog << "  import \"DPI-C\" function void " << dpiFuncName << "(longint cover_index);\n";
+  verilog << "  import \"DPI-C\" function void " << dpiFuncName << "(longint unsigned cover_index);\n";
   verilog << "  always @(posedge clock) begin\n";
   verilog << "    if (!reset" << extraCond << ") begin\n";
   verilog << funcCall;
