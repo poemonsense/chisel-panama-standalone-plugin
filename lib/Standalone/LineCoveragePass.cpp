@@ -11,6 +11,9 @@ class LineCoveragePass
   : public impl::LineCoveragePassBase<LineCoveragePass> {
 public:
   void runOnOperation() final;
+
+private:
+  Value getNonConstBranchCondition(Operation *op);
 };
 
 std::unique_ptr<mlir::Pass> createLineCoveragePass() {
@@ -24,17 +27,17 @@ void registerLineCoveragePass() {
 void LineCoveragePass::runOnOperation() {
   auto circuit = getOperation();
 
-  circuit.walk([&](WhenOp whenOp) {
-    auto condVal = whenOp.getCondition();
-    if (!condVal || condVal.getType().isConst())
+  circuit.walk([&](Operation *op) {
+    auto condVal = getNonConstBranchCondition(op);
+    if (!condVal)
       return;
 
     auto condDefOp = condVal.getDefiningOp();
     if (!condDefOp) {
-      OpBuilder builder(whenOp);
-      builder.setInsertionPoint(whenOp);
-      auto defName = builder.getStringAttr("cover_dummy_node");
-      condDefOp = builder.create<WireOp>(whenOp.getLoc(), condVal.getType(), defName);
+      OpBuilder builder(op);
+      builder.setInsertionPoint(op);
+      auto defName = builder.getStringAttr("line_cover_dummy");
+      condDefOp = builder.create<WireOp>(op->getLoc(), condVal.getType(), defName);
       builder.create<ConnectOp>(condDefOp->getLoc(), condDefOp->getResult(0), condVal);
     }
 
@@ -42,5 +45,20 @@ void LineCoveragePass::runOnOperation() {
   });
 }
 
+Value LineCoveragePass::getNonConstBranchCondition(Operation *op) {
+  // when (cond) { ... }
+  if (auto whenOp = dyn_cast<WhenOp>(op)) {
+    auto cond = whenOp.getCondition();
+    if (cond && !cond.getType().isConst())
+      return cond;
+  }
+  // Mux(cond, ..., ...)
+  else if (auto mux = dyn_cast<MuxPrimOp>(op)) {
+    auto cond = mux.getSel();
+    if (cond && !cond.getType().cast<FIRRTLType>().isConst())
+      return cond;
+  }
+  return nullptr;
+}
 
 } // namespace mlir::standalone
